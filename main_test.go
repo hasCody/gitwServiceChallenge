@@ -14,11 +14,12 @@ import (
 	`net/url`
 	`strconv`
 	`testing`
+	`strings`
 	`time`
+	`os`
 )
 
 const (
-	LocalHost = "http://localhost:8088/cache/"
     SocketTimeoutMs = 5000
 )
 
@@ -28,6 +29,22 @@ type CachePair struct {
 }
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func getServiceTestAddress() string {
+	host := strings.TrimSpace(os.Getenv("DEVTEST_HOST"))
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := strings.TrimSpace(os.Getenv("DEVTEST_PORT"))
+	if port == "" {
+		port = "8088"
+	}
+
+	res := "http://"+string(host)+":"+string(port)+"/cache/"
+
+	return res
+}
 
 func TestChallenge1Post(t *testing.T) {
 	// Start from a clean slate.
@@ -279,25 +296,26 @@ func TestChallenge2Crazy(t *testing.T) {
 	}
 
 	// Wait until all 100 workers have sent their request.
-	for i := 0; i < loop_size; i++ {
+	for i := 0; i < loop_size * 2; i++ {
 		<-sent
 	}
 
 	getAll(t, []*CachePair{})
 }
 
+// this test is to test persistance not ordering of scheduling requests
 func TestChallenge3(t *testing.T) {
 	deleteAll(t)
 
 	const cache_size = 1000
-	const calls_per_key = 20
-	const halt_seconds = 30
-	const sleep_millis = 10
+	const calls_per_key = 10
+	const halt_seconds = 10
+	const sleep_millis = 100
 
 	// Create 1000 keys.
 	var cache [cache_size]*CachePair
 	for i := 0; i < cache_size; i++ {
-		cp := &CachePair{Key: randomString(cache_size), Value: randomFloat()}
+		cp := &CachePair{Key: randomString(10)+fmt.Sprintf("%d", i), Value: randomFloat()}
 		cache[i] = cp
 		post(t, cp)
 	}
@@ -305,21 +323,21 @@ func TestChallenge3(t *testing.T) {
 
 	// For each key, make 20 puts with teeny tiny changes.
 	sent := make(chan bool)
-	for i := 0; i < cache_size; i++ {
-		for j := 0; j < calls_per_key; j++ {
+	for j := 0; j < calls_per_key; j++ {
+		for i := 0; i < cache_size; i++ {		
 			cache[i].Value = cache[i].Value.(float64) + 1
 			go putKeyAsync(t, cache[i], sent)
 		}
 
+		// Allow all calls to finish. We're accounting for 20 puts for each key.
+		for i := 0; i < cache_size; i++ {
+			<-sent
+		}
+
 		// Sleep for 10 milliseconds, just to give the service a chance.
-		time.Sleep(time.Millisecond * sleep_millis)
+		// time.Sleep(time.Millisecond * sleep_millis)
 	}
     fmt.Printf("Cache keys updated.\n")
-
-	// Allow all calls to finish. We're accounting for 20 puts for each key.
-	for i := 0; i < cache_size*calls_per_key; i++ {
-		<-sent
-	}
 
 	// Halt execution for 30 seconds to allow for server bounce.
 	fmt.Printf("\nChallenge 3 test case halted for %d seconds! Quick, bounce the cache service!\n", halt_seconds)
@@ -346,9 +364,20 @@ func TestChallenge4(t *testing.T) {
 
 	response := make(chan int64)
 
+    // Iterate through all of our responses. What happened?
+    sla_violations := 0
+
     for true == true {
         // Every 1000 iterations, get the cache, blow it away, start over.
         if total_reqs  > 0 && total_reqs % cache_size == 0 {
+			// Allow all calls to finish. We're accounting for 20 puts for each key.
+			for i := 0; i < cache_index * 2; i++ {
+				resp_time := <-response
+		        if resp_time > sla_millis {
+		            sla_violations++
+		        }
+			}
+
             // Sleep briefly, just to give the cache a chance.
             time.Sleep(time.Millisecond * sleep_millis)
             fmt.Printf("Request block %d.\n", total_reqs)
@@ -381,15 +410,10 @@ func TestChallenge4(t *testing.T) {
 
     time.Sleep(time.Millisecond * SocketTimeoutMs)
 
-    // Iterate through all of our responses. What happened?
-    sla_violations := 0
     // hackhackhack
-    reqs_to_examine := int(float64(total_reqs) * .75)
-    for i := 0; i < reqs_to_examine; i++ {
-        fmt.Printf("Examining response %d.\n", i)
+    for i := 0; i < cache_index * 2; i++ {
         resp_time := <-response
         if resp_time > sla_millis {
-            fmt.Printf("Response took %d\n", resp_time)
             sla_violations++
         }
 	}
@@ -411,7 +435,7 @@ func deleteAllAsyncForResponseTime(t *testing.T, response chan<- int64) {
 
 func deleteAll(t *testing.T) {
 	expectedStatus := http.StatusNoContent
-	req, err := http.NewRequest("DELETE", LocalHost, nil)
+	req, err := http.NewRequest("DELETE", getServiceTestAddress(), nil)
     req.Close = true
 	if err != nil {
 		t.Errorf("Delete call failed: %s", err)
@@ -419,11 +443,13 @@ func deleteAll(t *testing.T) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Errorf("Error reading response body: %s", err)
+		t.Errorf("Error reading response body: %s %s", err, getServiceTestAddress())
+	} else {
+		resp.Body.Close()
 	}
 
 	if resp.StatusCode != expectedStatus {
-		t.Errorf("Response code of %s doesn't match expected %s.", resp.StatusCode, expectedStatus)
+		t.Errorf("Response code of %d doesn't match expected %d.", resp.StatusCode, expectedStatus)
 	}
 }
 
@@ -432,7 +458,7 @@ func deleteKey(t *testing.T, cp *CachePair) {
 }
 
 func deleteKeyForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
-	endpoint := fmt.Sprintf("%s%s", LocalHost, getUrlFriendlyKey(cp))
+	endpoint := fmt.Sprintf("%s%s", getServiceTestAddress(), getUrlFriendlyKey(cp))
 	req, err := http.NewRequest("DELETE", endpoint, nil)
     req.Close = true
 	if err != nil {
@@ -442,10 +468,12 @@ func deleteKeyForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Errorf("Error reading response body: %s", err)
+	} else {
+		resp.Body.Close()
 	}
 
 	if resp.StatusCode != expectedStatus {
-		t.Errorf("Response code of %s doesn't match expected %s.", resp.StatusCode, expectedStatus)
+		t.Errorf("Response code of %d doesn't match expected %d.", resp.StatusCode, expectedStatus)
 	}
 }
 
@@ -481,19 +509,19 @@ func postForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
 		t.Errorf("Unable to marshal %s into json.", cp)
 	}
 
-	resp, err := http.Post(LocalHost, "application/json", bytes.NewReader(cpJson))
+	resp, err := http.Post(getServiceTestAddress(), "application/json", bytes.NewReader(cpJson))
 	if err != nil {
 		t.Errorf("Initial connection failed: %s", err)
 	}
-
 	defer resp.Body.Close()
+
 	_, err = ioutil.ReadAll(resp.Body)
 	if err != nil {
 		t.Errorf("Error reading response body: %s", err)
 	}
 
 	if resp.StatusCode != expectedStatus {
-		t.Errorf("Response code of %s doesn't match expected %s.", resp.StatusCode, expectedStatus)
+		t.Errorf("Response code of %d doesn't match expected %d.", resp.StatusCode, expectedStatus)
 	}
 }
 
@@ -514,7 +542,7 @@ func putKeyAsyncForResponseTime(t *testing.T, cp *CachePair, response chan<- int
 }
 
 func putKeyForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
-	endpoint := fmt.Sprintf("%s%s", LocalHost, getUrlFriendlyKey(cp))
+	endpoint := fmt.Sprintf("%s%s", getServiceTestAddress(), getUrlFriendlyKey(cp))
 	cpJson, err := json.Marshal(cp)
 
 	req, err := http.NewRequest("PUT", endpoint, bytes.NewReader(cpJson))
@@ -526,10 +554,12 @@ func putKeyForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Errorf("Error reading response body: %s", err)
+	} else {
+		resp.Body.Close()
 	}
 
 	if resp != nil && resp.StatusCode != expectedStatus {
-		t.Errorf("Response code of %s doesn't match expected %s.", resp.StatusCode, expectedStatus)
+		t.Errorf("Response code of %d doesn't match expected %d.", resp.StatusCode, expectedStatus)
 	}
 }
 
@@ -543,16 +573,17 @@ func getKeyAsync(t *testing.T, cp *CachePair, sent chan<- bool) {
 }
 
 func getKeyForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
-	endpoint := fmt.Sprintf("%s%s", LocalHost, getUrlFriendlyKey(cp))
+	endpoint := fmt.Sprintf("%s%s", getServiceTestAddress(), getUrlFriendlyKey(cp))
 	resp, err := http.Get(endpoint)
 
 	if err != nil {
 		t.Errorf("Initial connection failed: %s", err)
 		return
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != expectedStatus {
-		t.Errorf("Response code of %s doesn't match expected %s.", resp.StatusCode, expectedStatus)
+		t.Errorf("Response code of %d doesn't match expected %d.", resp.StatusCode, expectedStatus)
 		return
 	}
 
@@ -561,7 +592,6 @@ func getKeyForStatus(t *testing.T, cp *CachePair, expectedStatus int) {
 		return
 	}
 
-	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		t.Errorf("Error reading response body: %s", err)
@@ -599,19 +629,19 @@ func getAllAsync(t *testing.T, cpairs []*CachePair, sent chan<- bool) {
 
 func getAll(t *testing.T, cpairs []*CachePair) {
 	expectedStatus := http.StatusOK
-	resp, err := http.Get(LocalHost)
+	resp, err := http.Get(getServiceTestAddress())
 
 	if err != nil {
 		t.Errorf("Initial connection failed: %s", err)
 		return
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != expectedStatus {
-		t.Errorf("Response code of %s doesn't match expected %s.", resp.StatusCode, expectedStatus)
+		t.Errorf("Response code of %d doesn't match expected %d.", resp.StatusCode, expectedStatus)
 		return
 	}
 
-	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		t.Errorf("Error reading response body: %s", err)
